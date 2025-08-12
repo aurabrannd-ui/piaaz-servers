@@ -1,52 +1,76 @@
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from bots.manager import BotManager
-import os
+import time
+from typing import Dict
+from bots.tg_bot import TelegramClientBot
 
-app = Flask(__name__)
-CORS(app)
-manager = BotManager()
+class BotManager:
+    def __init__(self):
+        self.bots_meta: Dict[str, dict] = {}   # id -> meta/config
+        self.bots_obj: Dict[str, object] = {}  # id -> running object
 
-@app.get("/api/bots")
-def list_bots():
-    return jsonify(manager.list())
+    def list(self):
+        out=[]
+        for i,meta in self.bots_meta.items():
+            out.append({
+                "id": i,
+                "platform": meta["platform"],
+                "active": bool(self.bots_obj.get(i)),
+                "reply_mode": meta.get("reply_mode","text"),
+                "company": meta.get("company",{}),
+            })
+        return out
 
-@app.post("/api/activate")
-def activate():
-    data = request.get_json(force=True)
-    if data.get("platform") not in ("telegram","whatsapp","instagram"):
-        return jsonify({"error":"unsupported platform"}), 400
-    bot_id = manager.create(data)
-    return jsonify({"ok":True, "id": bot_id})
+    def create(self, meta: dict) -> str:
+        bot_id = meta.get("id") or f"bot_{int(time.time()*1000)}"
+        meta["id"] = bot_id
+        self.bots_meta[bot_id] = meta
+        self.start(bot_id)
+        return bot_id
 
-@app.post("/api/bots/<bot_id>/update")
-def update_bot(bot_id):
-    upd = request.get_json(force=True)
-    manager.update(bot_id, upd)
-    return jsonify({"ok":True})
+    def start(self, bot_id: str):
+        meta = self.bots_meta[bot_id]
+        platform = meta["platform"]
+        if platform == "telegram":
+            tg_token   = meta["creds"].get("tgToken","")
+            openai_key = meta["creds"].get("openai","")
+            profile = {
+                "reply_mode": meta.get("reply_mode","text"),
+                "company": meta.get("company",{}),
+                "voice": meta.get("voice")
+            }
+            bot = TelegramClientBot(bot_id, tg_token, openai_key, profile)
+            bot.start()
+            self.bots_obj[bot_id] = bot
+        else:
+            self.bots_obj[bot_id] = None  # WhatsApp/Instagram لاحقًا
 
-@app.post("/api/bots/<bot_id>/restart")
-def restart_bot(bot_id):
-    manager.restart(bot_id)
-    return jsonify({"ok":True})
+    def stop(self, bot_id:str):
+        bot = self.bots_obj.get(bot_id)
+        if bot:
+            try: bot.stop()
+            except: pass
+        self.bots_obj[bot_id] = None
 
-@app.delete("/api/bots/<bot_id>")
-def delete_bot(bot_id):
-    manager.stop(bot_id)
-    manager.bots_meta.pop(bot_id, None)
-    return jsonify({"ok":True})
+    def restart(self, bot_id:str):
+        self.stop(bot_id)
+        self.start(bot_id)
 
-# (اختياري) لو بدك تقدّم ملفات الواجهة من نفس الريبل
-FRONT = os.path.join(os.path.dirname(__file__), "..", "frontend")
-@app.get("/")
-def front_index():
-    if os.path.exists(os.path.join(FRONT,"index.html")):
-        return send_from_directory(FRONT, "index.html")
-    return jsonify({"ok":True, "service":"piaaz-server"})
+    def update(self, bot_id:str, meta_update: dict):
+        m = self.bots_meta.get(bot_id)
+        if not m: return
+        for k,v in meta_update.items():
+            if k=="company" and isinstance(v,dict):
+                m.setdefault("company",{}).update(v)
+            elif k=="creds" and isinstance(v,dict):
+                m.setdefault("creds",{}).update(v)
+            else:
+                m[k]=v
+        bot = self.bots_obj.get(bot_id)
+        if bot:
+            profile = {
+                "reply_mode": m.get("reply_mode","text"),
+                "company": m.get("company",{}),
+                "voice": m.get("voice")
+            }
+            new_openai = m.get("creds",{}).get("openai")
+            bot.update_profile(profile, new_openai)
 
-@app.get("/<path:path>")
-def front_static(path):
-    return send_from_directory(FRONT, path)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
