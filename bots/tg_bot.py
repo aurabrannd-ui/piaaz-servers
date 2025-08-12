@@ -96,3 +96,4 @@ class TelegramClientBot(threading.Thread):
         self.running = False
         try: self.tg.stop_polling()
         except: pass
+
