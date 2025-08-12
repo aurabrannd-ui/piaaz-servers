@@ -1,37 +1,41 @@
+# bots/manager.py
+# -*- coding: utf-8 -*-
 import time
 import logging
 import threading
-from typing import Dict, Optional
+from typing import Dict
 
-# عميل تيليجرام (مطلوب حالياً)
+# منصّة تيليجرام (موجودة لديك)
 from bots.tg_bot import TelegramClientBot
 
-# ملاحظة: سنحاول استيراد بقية المنصات إن وجدت ملفاتها
+# نحاول استيراد واتساب/إنستغرام إن كانت الملفات موجودة
 try:
-    from bots.wa_bot import WhatsAppClientBot  # اختياري
+    from bots.wa_bot import WhatsAppCloudBot as WhatsAppClientBot
 except Exception:
-    WhatsAppClientBot = None  # لا تكسر التطبيق لو غير متاح
+    WhatsAppClientBot = None
 
 try:
-    from bots.ig_bot import InstagramClientBot  # اختياري
+    from bots.ig_bot import InstagramDMClientBot as InstagramClientBot
 except Exception:
-    InstagramClientBot = None  # لا تكسر التطبيق لو غير متاح
+    InstagramClientBot = None
 
 
 class BotManager:
     """
-    مسؤول عن إدارة بوتات متعددة لمنصات مختلفة:
-    - Telegram (مُفعّل)
-    - WhatsApp / Instagram (اختياري: يعمل إذا وفّرت ملفات البوتات)
+    يدير بوتات متعددة عبر منصّات مختلفة بأسلوب webhook-only:
+    - Telegram / WhatsApp / Instagram
     """
 
     def __init__(self):
-        self.bots_meta: Dict[str, dict] = {}   # id -> meta/config (كما أرسلتها من الواجهة)
-        self.bots_obj:  Dict[str, object] = {} # id -> كائن البوت المشغّل أو None
+        self.bots_meta: Dict[str, dict] = {}   # id -> meta/config
+        self.bots_obj:  Dict[str, object] = {} # id -> running object (أو None)
+        # خرائط لتوجيه الويبهوك
+        self.wa_by_phone: Dict[str, str] = {}  # phone_number_id -> bot_id
+        self.ig_by_page:  Dict[str, str] = {}  # page_id         -> bot_id
         self._lock = threading.RLock()
         logging.getLogger(__name__).setLevel(logging.INFO)
 
-    # --------------------- أدوات مساعدة داخلية ---------------------
+    # ------------- أدوات داخليّة -------------
 
     def _gen_id(self) -> str:
         return f"bot_{int(time.time() * 1000)}"
@@ -40,6 +44,7 @@ class BotManager:
         if platform == "telegram":
             return ["openai", "tgToken"]
         if platform == "whatsapp":
+            # نطلب WABA ID للتماشي مع الواجهة، حتى لو ما نستخدمه مباشرة
             return ["openai", "waToken", "waPhoneId", "waWabaId"]
         if platform == "instagram":
             return ["openai", "igPageId", "igUserId", "igAccess"]
@@ -62,12 +67,14 @@ class BotManager:
         }
 
     def _need_restart_after_update(self, old: dict, new: dict) -> bool:
-        """نقرّر هل التحديث يتطلب إعادة تشغيل (مثلاً تغيّر المنصة أو مفاتيح حساسة)."""
+        """
+        هل يلزم إعادة تشغيل؟ نعم إذا تغيّرت المنصّة أو مفاتيح حسّاسة.
+        (هنا "إعادة التشغيل" تعني إعادة إنشاء الكائن وربطه بالخرائط)
+        """
         if old.get("platform") != new.get("platform"):
             return True
 
         o, n = old.get("creds", {}) or {}, new.get("creds", {}) or {}
-        # مفاتيح حسّاسة لكل منصة
         sensitive_by_platform = {
             "telegram":   ["openai", "tgToken"],
             "whatsapp":   ["openai", "waToken", "waPhoneId", "waWabaId"],
@@ -76,10 +83,9 @@ class BotManager:
         keys = sensitive_by_platform.get(new.get("platform"), [])
         return any((o.get(k) != n.get(k)) for k in keys)
 
-    # --------------------- واجهة الإدارة العامة ---------------------
+    # ------------- واجهة عامة -------------
 
     def list(self):
-        """إرجاع قائمة مبسّطة للاستهلاك من الواجهة."""
         with self._lock:
             out = []
             for i, meta in self.bots_meta.items():
@@ -93,22 +99,18 @@ class BotManager:
             return out
 
     def create(self, meta: dict) -> str:
-        """حفظ الـ meta وتشغيل البوت."""
         with self._lock:
             bot_id = meta.get("id") or self._gen_id()
             meta["id"] = bot_id
 
-            # تحقّق أساسي
             platform = meta.get("platform")
             if platform not in ("telegram", "whatsapp", "instagram"):
                 raise ValueError("Unsupported platform")
 
             if not self._has_all_creds(meta):
-                # لا نكسر، لكن نسجّل تحذير ونسمح بالحفظ (يمكن يكملها المستخدم لاحقاً)
                 logging.warning("Missing required credentials for %s (bot_id=%s)", platform, bot_id)
 
             self.bots_meta[bot_id] = meta
-            # حاول التشغيل (لو نقص شيء، ما نكسر)
             try:
                 self._start_unlocked(bot_id)
             except Exception as e:
@@ -130,50 +132,45 @@ class BotManager:
         creds = meta.get("creds") or {}
         profile = self._build_profile(meta)
 
-        # أوقف أي بوت سابق ثم شغّل الجديد
+        # أوقف القديم ثم أنشئ كائن جديد
         self._stop_unlocked(bot_id)
 
         if platform == "telegram":
-            tg_token = creds.get("tgToken", "")
+            tg_token   = creds.get("tgToken", "")
             openai_key = creds.get("openai", "")
             bot = TelegramClientBot(bot_id, tg_token, openai_key, profile)
-            bot.start()
+            # Webhook-only: لا حاجة لاستدعاء start()
             self.bots_obj[bot_id] = bot
-            logging.info("Telegram bot started: %s", bot_id)
+            logging.info("Telegram bot ready: %s", bot_id)
 
         elif platform == "whatsapp":
             if WhatsAppClientBot is None:
                 logging.warning("WhatsAppClientBot not available. Skipping start for %s", bot_id)
                 self.bots_obj[bot_id] = None
                 return
-            bot = WhatsAppClientBot(
-                bot_id=bot_id,
-                wa_token=creds.get("waToken", ""),
-                phone_id=creds.get("waPhoneId", ""),
-                waba_id=creds.get("waWabaId", ""),
-                openai_key=creds.get("openai", ""),
-                profile=profile
-            )
-            bot.start()
+            wa_token  = creds.get("waToken", "")
+            phone_id  = creds.get("waPhoneId", "")
+            openai_key = creds.get("openai", "")
+            bot = WhatsAppClientBot(bot_id, wa_token, phone_id, openai_key, profile)
             self.bots_obj[bot_id] = bot
-            logging.info("WhatsApp bot started: %s", bot_id)
+            if phone_id:
+                self.wa_by_phone[phone_id] = bot_id
+            logging.info("WhatsApp bot ready: %s (phone_id=%s)", bot_id, phone_id)
 
         elif platform == "instagram":
             if InstagramClientBot is None:
                 logging.warning("InstagramClientBot not available. Skipping start for %s", bot_id)
                 self.bots_obj[bot_id] = None
                 return
-            bot = InstagramClientBot(
-                bot_id=bot_id,
-                page_id=creds.get("igPageId", ""),
-                ig_user_id=creds.get("igUserId", ""),
-                page_access_token=creds.get("igAccess", ""),
-                openai_key=creds.get("openai", ""),
-                profile=profile
-            )
-            bot.start()
+            page_id   = creds.get("igPageId", "")
+            ig_user   = creds.get("igUserId", "")
+            ig_token  = creds.get("igAccess", "")
+            openai_key = creds.get("openai", "")
+            bot = InstagramClientBot(bot_id, page_id, ig_user, ig_token, openai_key, profile)
             self.bots_obj[bot_id] = bot
-            logging.info("Instagram bot started: %s", bot_id)
+            if page_id:
+                self.ig_by_page[page_id] = bot_id
+            logging.info("Instagram bot ready: %s (page_id=%s)", bot_id, page_id)
 
         else:
             raise ValueError("Unsupported platform")
@@ -190,6 +187,13 @@ class BotManager:
                     bot.stop()
             except Exception:
                 logging.exception("Error while stopping bot %s", bot_id)
+        # نظّف الخرائط
+        for k, v in list(self.wa_by_phone.items()):
+            if v == bot_id:
+                self.wa_by_phone.pop(k, None)
+        for k, v in list(self.ig_by_page.items()):
+            if v == bot_id:
+                self.ig_by_page.pop(k, None)
         self.bots_obj[bot_id] = None
         logging.info("Bot stopped: %s", bot_id)
 
@@ -199,13 +203,11 @@ class BotManager:
             self._start_unlocked(bot_id)
 
     def update(self, bot_id: str, meta_update: dict):
-        """تحديث الميتا + إعادة تشغيل فقط عند الحاجة، وإلا نعمل hot update."""
         with self._lock:
             old = self.bots_meta.get(bot_id)
             if not old:
                 return
 
-            # دمج حقول مع الحفاظ على البنى الداخلية
             merged = {**old}
             for k, v in meta_update.items():
                 if k == "company" and isinstance(v, dict):
@@ -218,7 +220,6 @@ class BotManager:
             need_restart = self._need_restart_after_update(old, merged)
             self.bots_meta[bot_id] = merged
 
-            bot = self.bots_obj.get(bot_id)
             if need_restart:
                 logging.info("Config changed (requires restart) for %s", bot_id)
                 self._stop_unlocked(bot_id)
@@ -227,7 +228,7 @@ class BotManager:
                 except Exception:
                     logging.exception("Restart failed for %s", bot_id)
             else:
-                # تحديث حيّ إن كانت البنية تدعم
+                bot = self.bots_obj.get(bot_id)
                 if bot and hasattr(bot, "update_profile"):
                     profile = self._build_profile(merged)
                     new_openai = (merged.get("creds") or {}).get("openai")
@@ -236,4 +237,34 @@ class BotManager:
                         logging.info("Hot-updated bot %s", bot_id)
                     except Exception:
                         logging.exception("Hot update failed for %s", bot_id)
+
+    # ------------- توجيه Webhooks -------------
+
+    def route_whatsapp(self, value: dict):
+        """
+        يأخذ value من payload['entry'][...]['changes'][...]['value']
+        ويستخرج phone_number_id لتحديد البوت.
+        """
+        meta = (value or {}).get("metadata") or {}
+        phone_number_id = meta.get("phone_number_id") or ""
+        # بعض الأحداث قد لا تحملها بوضوح—يمكن تعديل هذا الجزء لو تغيّر شكل الـ payload
+        bot_id = self.wa_by_phone.get(phone_number_id)
+        if not bot_id:
+            return
+        bot = self.bots_obj.get(bot_id)
+        if bot and hasattr(bot, "handle_webhook"):
+            bot.handle_webhook(value)
+
+    def route_instagram(self, value: dict):
+        """
+        يأخذ value من payload['entry'][...]['changes'][...]['value']
+        نحاول استنتاج page_id لربطه بالبوت.
+        """
+        page_id = value.get("id") or value.get("page_id") or ""
+        bot_id = self.ig_by_page.get(page_id)
+        if not bot_id:
+            return
+        bot = self.bots_obj.get(bot_id)
+        if bot and hasattr(bot, "handle_webhook"):
+            bot.handle_webhook(value)
 
