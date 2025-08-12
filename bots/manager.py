@@ -73,3 +73,4 @@ class BotManager:
             }
             new_openai = m.get("creds",{}).get("openai")
             bot.update_profile(profile, new_openai)
+
