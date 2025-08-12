@@ -1,9 +1,12 @@
 # bots/manager.py
 # -*- coding: utf-8 -*-
+import os
 import time
 import logging
 import threading
 from typing import Dict, Optional
+
+import requests
 
 # Telegram (مطلوب)
 from bots.tg_bot import TelegramClientBot
@@ -21,12 +24,15 @@ except Exception:
     InstagramDMClientBot = None  # ما نكسر التطبيق لو الملف مش موجود
 
 
+GRAPH = "https://graph.facebook.com/v19.0"
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "https://piaaz-servers.onrender.com")
+
 class BotManager:
     """
     إدارة عدة بوتات عبر منصات مختلفة:
-      - Telegram (مُفعّل)
-      - WhatsApp Cloud (اختياري)
-      - Instagram DM (اختياري)
+      - Telegram (مُفعّل + تعيين ويبهوك تلقائي)
+      - WhatsApp Cloud (اختياري: subscribe تلقائي للرقم)
+      - Instagram DM (اختياري: subscribe تلقائي للصفحة)
     """
 
     def __init__(self):
@@ -79,6 +85,48 @@ class BotManager:
         keys = sensitive_by_platform.get(new.get("platform"), [])
         return any((o.get(k) != n.get(k)) for k in keys)
 
+    # ---------- تفعيل/اشتراك Webhook تلقائي ----------
+
+    def _auto_webhook_telegram(self, bot_id: str, tg_token: str):
+        """يضبط Webhook لتيليجرام مباشرة."""
+        if not tg_token:
+            return
+        url = f"https://api.telegram.org/bot{tg_token}/setWebhook"
+        webhook = f"{PUBLIC_BASE}/webhooks/telegram/{bot_id}"
+        try:
+            r = requests.post(url, json={"url": webhook}, timeout=15)
+            ok = r.json().get("ok", False) if r.headers.get("content-type","").startswith("application/json") else False
+            logging.info("[TG auto-webhook] %s -> %s | ok=%s status=%s", bot_id, webhook, ok, r.status_code)
+        except Exception:
+            logging.exception("[TG auto-webhook] failed for %s", bot_id)
+
+    def _auto_subscribe_whatsapp(self, phone_id: str, wa_token: str):
+        """
+        يشترك الرقم في التطبيق (لا يضبط رابط الويبهوك من هنا؛
+        الرابط يُضبط مرة من لوحة Meta على /webhooks/meta).
+        """
+        if not (phone_id and wa_token):
+            return
+        url = f"{GRAPH}/{phone_id}/subscribed_apps"
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {wa_token}"}, timeout=20)
+            logging.info("[WA subscribe] phone_id=%s status=%s body=%s", phone_id, r.status_code, r.text[:200])
+        except Exception:
+            logging.exception("[WA subscribe] failed")
+
+    def _auto_subscribe_instagram(self, page_id: str, page_token: str):
+        """
+        يشترك الصفحة في التطبيق لاستقبال رسائل IG (الويبهوك على مستوى التطبيق يجب ضبطه من لوحة Meta).
+        """
+        if not (page_id and page_token):
+            return
+        url = f"{GRAPH}/{page_id}/subscribed_apps"
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {page_token}"}, timeout=20)
+            logging.info("[IG subscribe] page_id=%s status=%s body=%s", page_id, r.status_code, r.text[:200])
+        except Exception:
+            logging.exception("[IG subscribe] failed")
+
     # --------------- CRUD/إدارة عامة ---------------
 
     def list(self):
@@ -107,11 +155,23 @@ class BotManager:
                 logging.warning("Missing required credentials for %s (bot_id=%s)", platform, bot_id)
 
             self.bots_meta[bot_id] = meta
+
+            # تشغيل + تفعيل الويبهوك/الاشتراك
             try:
                 self._start_unlocked(bot_id)
+
+                creds = meta.get("creds") or {}
+                if platform == "telegram":
+                    self._auto_webhook_telegram(bot_id, creds.get("tgToken", ""))
+                elif platform == "whatsapp":
+                    self._auto_subscribe_whatsapp(creds.get("waPhoneId",""), creds.get("waToken",""))
+                elif platform == "instagram":
+                    # نستخدم page_id + page access token (igAccess)
+                    self._auto_subscribe_instagram(creds.get("igPageId",""), creds.get("igAccess",""))
             except Exception:
-                logging.exception("Start failed for %s", bot_id)
+                logging.exception("Start/auto-webhook failed for %s", bot_id)
                 self.bots_obj[bot_id] = None
+
             return bot_id
 
     def start(self, bot_id: str):
@@ -266,14 +326,14 @@ class BotManager:
 
         for bot in targets:
             try:
-                bot.handle_webhook(value)  # اسم الدالة حسب wa_bot.py
+                bot.handle_webhook(value)  # اسم الدالة في wa_bot.py
             except Exception:
                 logging.exception("WhatsApp handle_webhook failed")
 
     def route_instagram(self, value: dict):
         """
         يستقبل value = payload['entry'][..]['changes'][..]['value'] من /webhooks/instagram
-        ما في page_id في value مباشرة، فنوجّه لكل بوتات إنستغرام.
+        ما في page_id في value مباشرة، لذلك نوجّه لكل بوتات إنستغرام.
         """
         targets = []
         with self._lock:
@@ -286,7 +346,6 @@ class BotManager:
 
         for bot in targets:
             try:
-                bot.handle_webhook(value)  # اسم الدالة حسب ig_bot.py
+                bot.handle_webhook(value)  # اسم الدالة في ig_bot.py
             except Exception:
                 logging.exception("Instagram handle_webhook failed")
-
