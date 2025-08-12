@@ -1,5 +1,5 @@
 # bots/manager.py
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 import time
 import logging
 import threading
@@ -29,11 +29,11 @@ class BotManager:
       - Instagram DM (اختياري)
     """
 
-    def _init_(self):
+    def __init__(self):
         self.bots_meta: Dict[str, dict] = {}   # id -> meta/config (كما تأتي من الواجهة)
         self.bots_obj:  Dict[str, object] = {} # id -> كائن البوت المشغّل أو None
         self._lock = threading.RLock()
-        logging.getLogger(_name_).setLevel(logging.INFO)
+        logging.getLogger(__name__).setLevel(logging.INFO)
 
     # --------------- أدوات داخلية ---------------
 
@@ -134,7 +134,6 @@ class BotManager:
             tg_token   = creds.get("tgToken", "")
             openai_key = creds.get("openai", "")
             bot = TelegramClientBot(bot_id, tg_token, openai_key, profile)
-            # start/stop اختياريين — لو غير معرّفين ما نكسر
             if hasattr(bot, "start"):
                 try: bot.start()
                 except Exception: pass
@@ -258,7 +257,6 @@ class BotManager:
                 if phone_id and creds.get("waPhoneId") == phone_id:
                     targets.append(bot)
 
-            # لو ما لقينا بالـ phone_id، نرسل لكل بوتات واتساب (fallback)
             if not targets:
                 for bot_id, meta in self.bots_meta.items():
                     if meta.get("platform") == "whatsapp":
@@ -268,15 +266,14 @@ class BotManager:
 
         for bot in targets:
             try:
-                # اسم الدالة حسب ملفك wa_bot.py
-                bot.handle_webhook(value)
+                bot.handle_webhook(value)  # اسم الدالة حسب wa_bot.py
             except Exception:
                 logging.exception("WhatsApp handle_webhook failed")
 
     def route_instagram(self, value: dict):
         """
         يستقبل value = payload['entry'][..]['changes'][..]['value'] من /webhooks/instagram
-        ما في page_id في value مباشرة (app.py مرر value فقط)، لذلك نوجّه لكل بوتات إنستغرام.
+        ما في page_id في value مباشرة، فنوجّه لكل بوتات إنستغرام.
         """
         targets = []
         with self._lock:
@@ -289,7 +286,7 @@ class BotManager:
 
         for bot in targets:
             try:
-                # اسم الدالة حسب ملفك ig_bot.py
-                bot.handle_webhook(value)
+                bot.handle_webhook(value)  # اسم الدالة حسب ig_bot.py
             except Exception:
                 logging.exception("Instagram handle_webhook failed")
+
