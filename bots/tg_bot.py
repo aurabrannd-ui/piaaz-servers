@@ -1,6 +1,7 @@
 # bots/tg_bot.py
 # -*- coding: utf-8 -*-
 import io
+import os
 from typing import Dict, Optional, List
 
 from telebot import TeleBot
@@ -9,14 +10,9 @@ from telebot.types import Update, Message
 from services.nlp import generate_reply
 from services.tts import synth_eleven
 
-
 WELCOME = "مرحبًا {name}! أنا مساعد دعم {company}. أُجيبك فورًا وأرشدك لما تحتاجه."
 
-
 def build_system_prompt(company: dict) -> str:
-    """
-    يبني برومبت النظام اعتمادًا على بيانات الشركة — بالعربية الفصحى.
-    """
     name  = company.get("name", "الشركة")
     city  = company.get("city", "")
     hours = company.get("hours", {}) or {}
@@ -26,7 +22,6 @@ def build_system_prompt(company: dict) -> str:
     phone_cc  = (company.get("phone", {}) or {}).get("cc", "")
     phone_no  = (company.get("phone", {}) or {}).get("number", "")
     prompt    = company.get("prompt", "")
-
     sys = f"""
 أنت مساعد دعم للشركة "{name}" وتتحدث بالعربية الفصحى بنبرة مهذبة وواضحة.
 - الموقع: {city}
@@ -43,9 +38,7 @@ def build_system_prompt(company: dict) -> str:
 
 class TelegramClientBot:
     """
-    بوت تيليجرام يعمل بنمط الـ Webhook:
-      - يستقبل السيرفر POST من تيليجرام ويستدعي process_update(data).
-      - لا يستخدم polling.
+    Webhook-only bot: السيرفر يستقبل POST -> process_update(data)
     """
 
     def __init__(self, bot_id: str, tg_token: str, openai_key: str, profile: dict):
@@ -54,10 +47,20 @@ class TelegramClientBot:
         self.tg = TeleBot(tg_token, parse_mode="HTML")
         self.openai_key = openai_key
         self.profile = profile or {}
-        self.history: Dict[int, List[dict]] = {}  # chat_id -> [{"role":...,"content":...}]
+        self.history: Dict[int, List[dict]] = {}
         self._bind_handlers()
 
-    # -------- Handlers --------
+    # -------- Helpers --------
+    def _public_base(self) -> str:
+        base = os.environ.get("PUBLIC_BASE", "").rstrip("/")
+        return base
+
+    def _webhook_url(self) -> Optional[str]:
+        base = self._public_base()
+        if not base:
+            return None
+        return f"{base}/webhooks/telegram/{self.id}"
+
     def _bind_handlers(self):
         @self.tg.message_handler(content_types=["text", "voice", "audio"])
         def _on_message(m: Message):
@@ -75,20 +78,16 @@ class TelegramClientBot:
     def _handle_message(self, m: Message):
         try:
             chat_id = m.chat.id
-            # اسم المستخدم إن وُجد
             user_name = ""
             if getattr(m, "from_user", None):
                 user_name = (m.from_user.first_name or m.from_user.username or "").strip()
 
             sys = build_system_prompt(self.profile.get("company", {}))
-
-            # قراءة نص المستخدم (لا تحويل كلام-لنص الآن)
             if m.content_type == "text":
                 user_text = (m.text or "").strip()
             else:
                 user_text = "(أرسل المستخدم رسالة صوتية/ملفًا صوتيًا)"
 
-            # تحية بسيطة
             if user_text in {"مرحبا", "مرحبا.", "مرحبا!", "مرحبًا", "أهلا", "أهلًا", "السلام عليكم"}:
                 reply = WELCOME.format(
                     name=user_name or "صديقي",
@@ -98,15 +97,13 @@ class TelegramClientBot:
                 hist = self.history.get(chat_id, [])
                 reply = generate_reply(self.openai_key, sys, hist, user_text)
 
-            # تحديث الذاكرة (آخر 30 تبادل)
             hist = self.history.get(chat_id, [])
             hist += [{"role": "user", "content": user_text},
                      {"role": "assistant", "content": reply}]
             self.history[chat_id] = hist[-30:]
 
-            # وضع الرد
             mode = (self.profile.get("reply_mode") or "text").lower()
-            voice_cfg = self.profile.get("voice")  # {"ek": "...", "vid": "..."} أو None
+            voice_cfg = self.profile.get("voice")  # {"ek","vid"} أو None
 
             if mode == "text":
                 self._send_text(chat_id, reply, reply_to=m.message_id)
@@ -127,7 +124,6 @@ class TelegramClientBot:
             except Exception:
                 pass
 
-    # -------- Send helpers --------
     def _send_text(self, chat_id: int, text: str, reply_to: Optional[int] = None):
         self.tg.send_message(chat_id, text, reply_to_message_id=reply_to)
 
@@ -135,18 +131,11 @@ class TelegramClientBot:
         return bool(voice_cfg and voice_cfg.get("ek") and voice_cfg.get("vid"))
 
     def _send_voice(self, chat_id: int, text: str, voice_cfg: dict, reply_to: Optional[int] = None):
-        """
-        يُنتج صوت OGG مناسب لإرساله كـ voice في تيليجرام.
-        """
         audio_bytes = synth_eleven(voice_cfg["ek"], voice_cfg["vid"], text)
         self.tg.send_voice(chat_id, io.BytesIO(audio_bytes), reply_to_message_id=reply_to)
 
     # -------- Webhook integration --------
     def process_update(self, data: dict):
-        """
-        تُستدعى من مسار الويبهوك في Flask:
-            bot.process_update(request.get_json())
-        """
         try:
             upd = Update.de_json(data)
             self.tg.process_new_updates([upd])
@@ -156,23 +145,29 @@ class TelegramClientBot:
     # -------- Lifecycle --------
     def start(self):
         """
-        لا نستخدم polling هنا. يمكنك ضبط الـ webhook خارجياً عبر BotFather أو عبر:
-            self.tg.set_webhook(url_full)
-        (اتركها فارغة إن كنت تضبط الويبهوك من خارج الكود.)
+        يضبط Webhook تلقائيًا كل مرة نبدأ فيها (تشغيل أول مرة أو بعد تغيير التوكن).
         """
-        return
+        try:
+            url = self._webhook_url()
+            if url:
+                # drop_pending_updates=True عشان نقطع أي رسائل قديمة كانت رايحة للتوكن القديم
+                self.tg.set_webhook(url=url, drop_pending_updates=True,
+                                    allowed_updates=["message", "edited_message"])
+                print(f"[TG:{self.id}] webhook set: {url}")
+        except Exception as e:
+            print(f"[TG:{self.id}] set_webhook error:", e)
 
     def stop(self):
         """
-        لا يوجد شيء محدد لإيقافه في وضع الويبهوك.
+        إزالة الويبهوك عند الإيقاف (قبل إعادة التشغيل أو الحذف).
         """
         try:
-            self.tg.remove_webhook()  # لا يضر إن لم يكن مضبوطًا
+            self.tg.remove_webhook()
         except Exception:
             pass
 
-    # تحديث الإعدادات دون إعادة التشغيل (إن أمكن)
     def update_profile(self, new_profile: dict, new_openai: Optional[str] = None):
         if new_openai:
             self.openai_key = new_openai
         self.profile = new_profile
+
