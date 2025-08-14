@@ -1,22 +1,39 @@
 # app.py
-# -*- coding: utf-8 -*-
-from flask import Flask, request, jsonify, send_from_directory, abort
+# -- coding: utf-8 --
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from functools import wraps
+from dotenv import load_dotenv
 import os
 import requests
+import re
 
 from bots.manager import BotManager
 
-# إعدادات Supabase (واجهة)
-SUPABASE_URL = "https://roahzmbpajuxyqqeloyu.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJvYWh6bWJwYWp1eHlxcWVsb3l1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ5OTczNzQsImV4cCI6MjA3MDU3MzM3NH0.Zk1YE_ikgVPHxDZu_gC4uJWywZbW9plD5SJ1igprCQ8"
+# تحميل المتغيرات من ملف .env
+load_dotenv()
 
-app = Flask(__name__)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in .env file")
+
+app = Flask(_name_)
 CORS(app)
 manager = BotManager()
 
-# ============ تحقق جلسة واجهة (Bearer من Supabase) ============
+# ===== Rate limiting بسيط =====
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["200 per minute"]  # تعديل حسب الحاجة
+)
+
+# ===== التحقق من التوكن =====
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -24,24 +41,33 @@ def require_auth(f):
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
         token = auth_header.split(" ", 1)[1]
-        resp = requests.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
-            timeout=20,
-        )
+        if not re.match(r"^[A-Za-z0-9\-\._~\+\/]+=*$", token):
+            return jsonify({"error": "Invalid token format"}), 401
+
+        try:
+            resp = requests.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
+                timeout=10
+            )
+        except requests.RequestException:
+            return jsonify({"error": "Auth server not reachable"}), 503
+
         if resp.status_code != 200:
             return jsonify({"error": "Invalid or expired token"}), 401
         return f(*args, **kwargs)
     return decorated
 
-# ============ API (محمية) ============
+# ===== API المحمية =====
 @app.get("/api/bots")
 @require_auth
+@limiter.limit("50/minute")
 def list_bots():
     return jsonify(manager.list())
 
 @app.post("/api/activate")
 @require_auth
+@limiter.limit("20/minute")
 def activate():
     data = request.get_json(force=True)
     if data.get("platform") not in ("telegram", "whatsapp", "instagram"):
@@ -69,9 +95,7 @@ def delete_bot(bot_id):
     manager.bots_meta.pop(bot_id, None)
     return jsonify({"ok": True})
 
-# ============ Webhooks (عامة) ============
-
-# Telegram: نستخدم bot_id لسهولة التوجيه لـ manager.bots_obj[bot_id]
+# ===== Webhooks =====
 @app.post("/webhooks/telegram/<bot_id>")
 def telegram_webhook(bot_id):
     bot = manager.bots_obj.get(bot_id)
@@ -85,27 +109,21 @@ def telegram_webhook(bot_id):
         print("[TG webhook] error:", e)
         return jsonify({"ok": False}), 500
 
-# Meta verification (WhatsApp/Instagram) GET?hub.challenge
 @app.get("/webhooks/meta")
 def meta_verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    # اختياري: تحقّق verify_token لو عاملينه
-    # إن بدك تتحكم فيه، ضيف متغير بيئي VERIFY_TOKEN وقارن:
-    VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
     if mode == "subscribe" and challenge is not None:
-        if not VERIFY_TOKEN or token == VERIFY_TOKEN:
+        if not META_VERIFY_TOKEN or token == META_VERIFY_TOKEN:
             return challenge, 200
         return "Forbidden", 403
     return "Bad Request", 400
 
-# WhatsApp Cloud webhook (POST من Meta)
 @app.post("/webhooks/whatsapp")
 def whatsapp_webhook():
     data = request.get_json(force=True, silent=True) or {}
     try:
-        # payload بصيغة Meta القياسية: entry -> changes -> value
         entries = data.get("entry", []) or []
         for entry in entries:
             changes = entry.get("changes", []) or []
@@ -117,7 +135,6 @@ def whatsapp_webhook():
         print("[WA webhook] error:", e)
         return jsonify({"ok": False}), 500
 
-# Instagram Messaging webhook (POST من Meta)
 @app.post("/webhooks/instagram")
 def instagram_webhook():
     data = request.get_json(force=True, silent=True) or {}
@@ -133,8 +150,8 @@ def instagram_webhook():
         print("[IG webhook] error:", e)
         return jsonify({"ok": False}), 500
 
-# ============ تقديم الواجهة الأمامية (اختياري) ============
-FRONT = os.path.join(os.path.dirname(__file__), "..", "frontend")
+# ===== Frontend =====
+FRONT = os.path.join(os.path.dirname(_file_), "..", "frontend")
 
 @app.get("/")
 def front_index():
@@ -150,11 +167,9 @@ def front_index():
 def front_static(path):
     return send_from_directory(FRONT, path)
 
-# ============ Health ============
 @app.get("/healthz")
 def health():
     return jsonify({"ok": True})
 
-if __name__ == "__main__":
-    # في الإنتاج (Render/Gunicorn) ما رح يُستخدم هذا غالبًا
+if _name_ == "_main_":
     app.run(host="0.0.0.0", port=5000)
