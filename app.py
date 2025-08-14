@@ -1,54 +1,74 @@
 # app.py
 # -- coding: utf-8 --
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from functools import wraps
 from dotenv import load_dotenv
-import os
-import requests
-import re
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import os, requests, re, hmac, hashlib
 
 from bots.manager import BotManager
 
-# تحميل المتغيرات من ملف .env
+# -------- Load env --------
 load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+SUPABASE_URL       = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY  = os.getenv("SUPABASE_ANON_KEY")
+META_VERIFY_TOKEN  = os.getenv("META_VERIFY_TOKEN", "")
+META_APP_SECRET    = os.getenv("META_APP_SECRET", "")  # اختياري للتحقق من التوقيع
+FRONT_ALLOWED_ORIGINS = os.getenv(
+    "FRONT_ALLOWED_ORIGINS",
+    "https://piaaz.com,https://www.piaaz.com,http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in .env file")
+    raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in .env")
 
 app = Flask(_name_)
-CORS(app)
+
+# حد أقصى لحجم الطلب ( 1MB كفاية للويبهوكس/JSON )
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+
+# CORS مقيد
+CORS(app, resources={
+    r"/api/*": {"origins": FRONT_ALLOWED_ORIGINS},
+    r"/webhooks/": {"origins": ""}  # الويبهوكس من مزودين خارج الموقع
+})
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address, app=app, default_limits=["200 per minute"])
+
 manager = BotManager()
 
-# ===== Rate limiting بسيط =====
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-limiter = Limiter(
-    key_func=get_remote_address,
-    app=app,
-    default_limits=["200 per minute"]  # تعديل حسب الحاجة
-)
+# --------- Security headers ---------
+@app.after_request
+def harden_headers(resp):
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["X-XSS-Protection"] = "0"
+    # CSP بسيطة (عدّل لو عندك سكربتات inline كثيرة)
+    resp.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline' https: data: blob:"
+    return resp
 
-# ===== التحقق من التوكن =====
+# --------- Supabase Bearer auth ---------
+token_re = re.compile(r"^[A-Za-z0-9\-\.~\+\/]+=*$")
+
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
-        token = auth_header.split(" ", 1)[1]
-        if not re.match(r"^[A-Za-z0-9\-\._~\+\/]+=*$", token):
+        token = auth_header.split(" ", 1)[1].strip()
+        if not _token_re.match(token):
             return jsonify({"error": "Invalid token format"}), 401
 
         try:
             resp = requests.get(
                 f"{SUPABASE_URL}/auth/v1/user",
                 headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
-                timeout=10
+                timeout=10,
             )
         except requests.RequestException:
             return jsonify({"error": "Auth server not reachable"}), 503
@@ -58,7 +78,21 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# ===== API المحمية =====
+# --------- Optional: verify Meta signature ---------
+def verify_meta_signature() -> bool:
+    """تحقق توقيع X-Hub-Signature-256 إذا كان META_APP_SECRET مضبوطاً."""
+    if not META_APP_SECRET:
+        return True  # غير مفعّل، لا نكسر الويبهوك
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if not sig.startswith("sha256="):
+        return False
+    provided = sig.split("=", 1)[1]
+    body = request.get_data() or b""
+    expected = hmac.new(META_APP_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    # مقارنة آمنة
+    return hmac.compare_digest(provided, expected)
+
+# ================= Protected API =================
 @app.get("/api/bots")
 @require_auth
 @limiter.limit("50/minute")
@@ -69,7 +103,9 @@ def list_bots():
 @require_auth
 @limiter.limit("20/minute")
 def activate():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid payload"}), 400
     if data.get("platform") not in ("telegram", "whatsapp", "instagram"):
         return jsonify({"error": "unsupported platform"}), 400
     bot_id = manager.create(data)
@@ -77,27 +113,33 @@ def activate():
 
 @app.post("/api/bots/<bot_id>/update")
 @require_auth
+@limiter.limit("30/minute")
 def update_bot(bot_id):
-    upd = request.get_json(force=True)
+    upd = request.get_json(force=True, silent=True)
+    if not isinstance(upd, dict):
+        return jsonify({"error": "invalid payload"}), 400
     manager.update(bot_id, upd)
     return jsonify({"ok": True})
 
 @app.post("/api/bots/<bot_id>/restart")
 @require_auth
+@limiter.limit("20/minute")
 def restart_bot(bot_id):
     manager.restart(bot_id)
     return jsonify({"ok": True})
 
 @app.delete("/api/bots/<bot_id>")
 @require_auth
+@limiter.limit("20/minute")
 def delete_bot(bot_id):
     manager.stop(bot_id)
     manager.bots_meta.pop(bot_id, None)
     return jsonify({"ok": True})
 
-# ===== Webhooks =====
+# ================= Webhooks (public) =================
 @app.post("/webhooks/telegram/<bot_id>")
 def telegram_webhook(bot_id):
+    # Telegram لا يرسل توقيع HMAC افتراضياً، نعتمد على سرية URL
     bot = manager.bots_obj.get(bot_id)
     if not bot or not hasattr(bot, "process_update"):
         return jsonify({"error": "bot not found or not ready"}), 404
@@ -109,6 +151,7 @@ def telegram_webhook(bot_id):
         print("[TG webhook] error:", e)
         return jsonify({"ok": False}), 500
 
+# Meta verification (GET)
 @app.get("/webhooks/meta")
 def meta_verify():
     mode = request.args.get("hub.mode")
@@ -120,37 +163,37 @@ def meta_verify():
         return "Forbidden", 403
     return "Bad Request", 400
 
+# WhatsApp webhook (POST)
 @app.post("/webhooks/whatsapp")
 def whatsapp_webhook():
+    if not verify_meta_signature():
+        return jsonify({"error": "invalid signature"}), 401
     data = request.get_json(force=True, silent=True) or {}
     try:
-        entries = data.get("entry", []) or []
-        for entry in entries:
-            changes = entry.get("changes", []) or []
-            for ch in changes:
-                value = ch.get("value") or {}
-                manager.route_whatsapp(value)
+        for entry in (data.get("entry") or []):
+            for ch in (entry.get("changes") or []):
+                manager.route_whatsapp(ch.get("value") or {})
         return jsonify({"ok": True})
     except Exception as e:
         print("[WA webhook] error:", e)
         return jsonify({"ok": False}), 500
 
+# Instagram webhook (POST)
 @app.post("/webhooks/instagram")
 def instagram_webhook():
+    if not verify_meta_signature():
+        return jsonify({"error": "invalid signature"}), 401
     data = request.get_json(force=True, silent=True) or {}
     try:
-        entries = data.get("entry", []) or []
-        for entry in entries:
-            changes = entry.get("changes", []) or []
-            for ch in changes:
-                value = ch.get("value") or {}
-                manager.route_instagram(value)
+        for entry in (data.get("entry") or []):
+            for ch in (entry.get("changes") or []):
+                manager.route_instagram(ch.get("value") or {})
         return jsonify({"ok": True})
     except Exception as e:
         print("[IG webhook] error:", e)
         return jsonify({"ok": False}), 500
 
-# ===== Frontend =====
+# ================= Frontend =================
 FRONT = os.path.join(os.path.dirname(_file_), "..", "frontend")
 
 @app.get("/")
@@ -172,4 +215,5 @@ def health():
     return jsonify({"ok": True})
 
 if _name_ == "_main_":
+    # في الإنتاج (Gunicorn/Render) عادةً ما يُتجاهل
     app.run(host="0.0.0.0", port=5000)
