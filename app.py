@@ -1,6 +1,6 @@
 # app.py
 # -- coding: utf-8 --
-from flask import Flask, request, jsonify, send_from_directory, abort
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from functools import wraps
 from dotenv import load_dotenv
@@ -10,48 +10,66 @@ import os, requests, re, hmac, hashlib
 
 from bots.manager import BotManager
 
-# -------- Load env --------
+# ================= Load env =================
 load_dotenv()
-SUPABASE_URL       = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY  = os.getenv("SUPABASE_ANON_KEY")
-META_VERIFY_TOKEN  = os.getenv("META_VERIFY_TOKEN", "")
-META_APP_SECRET    = os.getenv("META_APP_SECRET", "")  # اختياري للتحقق من التوقيع
-FRONT_ALLOWED_ORIGINS = os.getenv(
-    "FRONT_ALLOWED_ORIGINS",
-    "https://piaaz.com,https://www.piaaz.com,http://localhost:3000,http://127.0.0.1:3000"
-).split(",")
+SUPABASE_URL        = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY   = os.getenv("SUPABASE_ANON_KEY")
+META_VERIFY_TOKEN   = os.getenv("META_VERIFY_TOKEN", "")
+META_APP_SECRET     = os.getenv("META_APP_SECRET", "")  # optional: HMAC for Meta webhooks
+PUBLIC_BASE         = os.getenv("PUBLIC_BASE", "https://piaaz.com")
+FRONT_ALLOWED_ORIGINS = list({
+    o.strip() for o in (
+        os.getenv(
+            "FRONT_ALLOWED_ORIGINS",
+            f"{PUBLIC_BASE},https://www.piaaz.com,http://localhost:3000,http://127.0.0.1:3000"
+        ).split(",")
+    ) if o.strip()
+})
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in .env")
+    raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment")
 
 app = Flask(_name_)
 
-# حد أقصى لحجم الطلب ( 1MB كفاية للويبهوكس/JSON )
+# أقصى حجم للطلبات (1MB يكفي ل JSON / webhooks)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
-# CORS مقيد
+# ================= CORS =================
+# نقيّد فقط /api/* للأصول المسموحة. الويبهوكس غالباً من مزوّدين خارج المتصفح.
 CORS(app, resources={
     r"/api/*": {"origins": FRONT_ALLOWED_ORIGINS},
-    r"/webhooks/": {"origins": ""}  # الويبهوكس من مزودين خارج الموقع
+    r"/webhooks/": {"origins": ""},
 })
 
-# Rate limiting
-limiter = Limiter(key_func=get_remote_address, app=app, default_limits=["200 per minute"])
+# ================= Rate limiting =================
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["200 per minute"],  # limit افتراضي
+)
 
 manager = BotManager()
 
-# --------- Security headers ---------
+# ================= Security headers =================
 @app.after_request
 def harden_headers(resp):
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    resp.headers["X-XSS-Protection"] = "0"
-    # CSP بسيطة (عدّل لو عندك سكربتات inline كثيرة)
-    resp.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline' https: data: blob:"
+    # هيدرز أمان لا تكسر الواجهة
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    # CSP بسيطة تسمح بملفاتك والـ CDNs الشائعة و inline (لأن عندك inline CSS/JS)
+    resp.headers.setdefault("Content-Security-Policy",
+        "default-src 'self' https: data: blob:; "
+        "img-src 'self' https: data: blob:; "
+        "style-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline' https:; "
+        "connect-src 'self' https:; "
+        "frame-ancestors 'none';"
+    )
     return resp
 
-# --------- Supabase Bearer auth ---------
+# ================= Supabase Bearer auth =================
 token_re = re.compile(r"^[A-Za-z0-9\-\.~\+\/]+=*$")
 
 def require_auth(f):
@@ -60,6 +78,7 @@ def require_auth(f):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
+
         token = auth_header.split(" ", 1)[1].strip()
         if not _token_re.match(token):
             return jsonify({"error": "Invalid token format"}), 401
@@ -68,7 +87,7 @@ def require_auth(f):
             resp = requests.get(
                 f"{SUPABASE_URL}/auth/v1/user",
                 headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
-                timeout=10,
+                timeout=10
             )
         except requests.RequestException:
             return jsonify({"error": "Auth server not reachable"}), 503
@@ -78,18 +97,20 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# --------- Optional: verify Meta signature ---------
+# ================= Optional: verify Meta signature =================
 def verify_meta_signature() -> bool:
-    """تحقق توقيع X-Hub-Signature-256 إذا كان META_APP_SECRET مضبوطاً."""
+    """
+    يتحقق من X-Hub-Signature-256 إذا ضبّطت META_APP_SECRET.
+    إذا ما في secret، بنرجّع True حتى ما نكسر الويبهوك.
+    """
     if not META_APP_SECRET:
-        return True  # غير مفعّل، لا نكسر الويبهوك
+        return True
     sig = request.headers.get("X-Hub-Signature-256", "")
     if not sig.startswith("sha256="):
         return False
     provided = sig.split("=", 1)[1]
     body = request.get_data() or b""
     expected = hmac.new(META_APP_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    # مقارنة آمنة
     return hmac.compare_digest(provided, expected)
 
 # ================= Protected API =================
@@ -136,10 +157,24 @@ def delete_bot(bot_id):
     manager.bots_meta.pop(bot_id, None)
     return jsonify({"ok": True})
 
+# أخطاء موحّدة لمسارات الـ API فقط
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "not found"}), 404
+    return e
+
+@app.errorhandler(405)
+def not_allowed(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "method not allowed"}), 405
+    return e
+
 # ================= Webhooks (public) =================
+# Telegram
 @app.post("/webhooks/telegram/<bot_id>")
 def telegram_webhook(bot_id):
-    # Telegram لا يرسل توقيع HMAC افتراضياً، نعتمد على سرية URL
+    # Telegram ما بضيف HMAC افتراضياً، منكتفي بسرية URL
     bot = manager.bots_obj.get(bot_id)
     if not bot or not hasattr(bot, "process_update"):
         return jsonify({"error": "bot not found or not ready"}), 404
@@ -163,7 +198,7 @@ def meta_verify():
         return "Forbidden", 403
     return "Bad Request", 400
 
-# WhatsApp webhook (POST)
+# WhatsApp
 @app.post("/webhooks/whatsapp")
 def whatsapp_webhook():
     if not verify_meta_signature():
@@ -178,7 +213,7 @@ def whatsapp_webhook():
         print("[WA webhook] error:", e)
         return jsonify({"ok": False}), 500
 
-# Instagram webhook (POST)
+# Instagram
 @app.post("/webhooks/instagram")
 def instagram_webhook():
     if not verify_meta_signature():
@@ -210,10 +245,11 @@ def front_index():
 def front_static(path):
     return send_from_directory(FRONT, path)
 
+# Health
 @app.get("/healthz")
 def health():
     return jsonify({"ok": True})
 
 if _name_ == "_main_":
-    # في الإنتاج (Gunicorn/Render) عادةً ما يُتجاهل
+    # في الإنتاج (Gunicorn/Render) عادةً ما يُستبدَل بـ gunicorn
     app.run(host="0.0.0.0", port=5000)
